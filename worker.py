@@ -9,6 +9,7 @@ import subprocess
 import shutil
 import threading
 import logging
+import psutil
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -368,6 +369,10 @@ class MT5Worker:
             self.logger.info(f"MT5 terminal process spawned (PID: {self.mt5_process.pid})")
             
             time.sleep(5)
+            # Under Wine/Windows, terminal64.exe may fork into a child process and the parent may exit cleanly
+            term_proc = self.get_terminal_process()
+            if term_proc:
+                self.logger.info(f"Active MT5 terminal process detected (PID: {term_proc.pid})")
             return True
         except Exception as e:
             self.logger.error(f"Failed to launch MT5 subprocess: {e}")
@@ -400,15 +405,61 @@ class MT5Worker:
         self.logger.info("Successfully bound to MetaTrader5 API.")
         return True
 
+    def get_terminal_process(self):
+        """Finds any active MT5 terminal process running from this clone directory."""
+        try:
+            clone_dir_abs = os.path.abspath(self.clone_dir).lower()
+            clone_name = os.path.basename(self.clone_dir).lower()
+            for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
+                try:
+                    exe = proc.info.get('exe')
+                    if exe and os.path.abspath(exe).lower().startswith(clone_dir_abs):
+                        return proc
+                    name = (proc.info.get('name') or '').lower()
+                    if "terminal" in name or "wine" in name:
+                        cmdline = proc.info.get('cmdline') or []
+                        cmdline_str = " ".join(cmdline).lower()
+                        if clone_dir_abs in cmdline_str or clone_name in cmdline_str:
+                            return proc
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+        except Exception as e:
+            self.logger.debug(f"Error searching for terminal process: {e}")
+        return None
+
+    def is_terminal_running(self):
+        """Checks if the MT5 terminal process for this clone is currently running."""
+        # 1. Direct subprocess check
+        if self.mt5_process is not None and self.mt5_process.poll() is None:
+            return True
+            
+        # 2. Check via psutil (handles detached/forked processes in Wine)
+        proc = self.get_terminal_process()
+        if proc is not None and proc.is_running():
+            return True
+            
+        # 3. Check via MT5 API IPC connection
+        try:
+            if mt5.terminal_info() is not None:
+                return True
+        except Exception:
+            pass
+            
+        return False
+
     def check_connection(self):
         """Checks if terminal is online and logged in."""
-        t_info = mt5.terminal_info()
-        a_info = mt5.account_info()
-        
-        if t_info is None or a_info is None:
-            return False
+        try:
+            t_info = mt5.terminal_info()
+            a_info = mt5.account_info()
             
-        return t_info.connected
+            if t_info is None or a_info is None:
+                return False
+                
+            return bool(t_info.connected)
+        except Exception as e:
+            self.logger.error(f"Error checking terminal connection: {e}")
+            return False
 
     def sync_closed_trades(self):
         """Fetch closed trades from history and report them to the Bhionex API."""
@@ -547,11 +598,20 @@ class MT5Worker:
             
         while not self.stop_event.is_set():
             try:
-                proc_running = self.mt5_process is not None and self.mt5_process.poll() is None
+                proc_running = self.is_terminal_running()
                 
                 connected = False
                 if proc_running:
                     connected = self.check_connection()
+                    if not connected:
+                        # If the process is alive but terminal_info is None, try reconnecting API
+                        try:
+                            if mt5.terminal_info() is None:
+                                self.logger.warning("Terminal process is alive but MT5 API disconnected. Attempting API reconnect...")
+                                if self.connect_mt5():
+                                    connected = self.check_connection()
+                        except Exception:
+                            pass
                     
                 if not proc_running or not connected:
                     consecutive_failures += 1
@@ -607,25 +667,46 @@ class MT5Worker:
             self.connect_mt5()
 
     def kill_process(self):
-        """Forcibly terminates the MT5 terminal process."""
+        """Forcibly terminates the MT5 terminal process and any processes running from clone_dir."""
+        # 1. Terminate tracked subprocess handle if alive
         if self.mt5_process:
-            self.logger.info(f"Terminating terminal process (PID: {self.mt5_process.pid})...")
+            self.logger.info(f"Terminating tracked terminal process (PID: {self.mt5_process.pid})...")
             try:
-                self.mt5_process.terminate()
-                self.mt5_process.wait(timeout=5)
-                self.logger.info("Process terminated cleanly.")
-            except subprocess.TimeoutExpired:
-                self.logger.warning("Process did not terminate. Forcing kill...")
+                if self.mt5_process.poll() is None:
+                    self.mt5_process.terminate()
+                    self.mt5_process.wait(timeout=3)
+                    self.logger.info("Tracked process terminated.")
+            except Exception:
                 try:
                     self.mt5_process.kill()
-                    self.mt5_process.wait()
-                    self.logger.info("Process killed.")
-                except Exception as e:
-                    self.logger.error(f"Failed to kill process: {e}")
-            except Exception as e:
-                self.logger.error(f"Failed to terminate process: {e}")
+                except Exception:
+                    pass
             finally:
                 self.mt5_process = None
+
+        # 2. Terminate any terminal processes running from this clone directory (handles Wine child/forked processes)
+        try:
+            clone_dir_abs = os.path.abspath(self.clone_dir).lower()
+            clone_name = os.path.basename(self.clone_dir).lower()
+            for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
+                try:
+                    exe = proc.info.get('exe')
+                    cmdline = proc.info.get('cmdline') or []
+                    cmdline_str = " ".join(cmdline).lower()
+                    name = (proc.info.get('name') or '').lower()
+
+                    matches_dir = exe and os.path.abspath(exe).lower().startswith(clone_dir_abs)
+                    matches_cmd = ("terminal" in name or "wine" in name) and (clone_dir_abs in cmdline_str or clone_name in cmdline_str)
+
+                    if matches_dir or matches_cmd:
+                        self.logger.info(f"Terminating cloned MT5 process (PID: {proc.pid})...")
+                        proc.kill()
+                        proc.wait(timeout=3)
+                        self.logger.info(f"Process {proc.pid} terminated cleanly.")
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired, OSError):
+                    pass
+        except Exception as e:
+            self.logger.error(f"Error terminating processes in clone dir: {e}")
 
     def start(self):
         """Launches the worker thread."""
