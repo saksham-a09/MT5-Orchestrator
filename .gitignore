@@ -33,3 +33,6 @@ worker_*.log
 docs/bhionex-doc-for-bot.html
 docs/bhionex-doc-for-bot.txt
 *.zip
+
+# Scripts
+clean_master.bat
