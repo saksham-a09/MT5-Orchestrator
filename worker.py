@@ -368,18 +368,32 @@ class MT5Worker:
                 )
             self.logger.info(f"MT5 terminal process spawned (PID: {self.mt5_process.pid})")
             
-            time.sleep(5)
+            # Allow time for MT5 to start up (Wine needs more time than Windows)
+            startup_wait = 15 if is_wine() else 5
+            self.logger.info(f"Waiting {startup_wait}s for MT5 terminal startup...")
+            time.sleep(startup_wait)
+            
+            # Check if process died immediately
+            if self.mt5_process.poll() is not None:
+                self.logger.error(f"MT5 terminal process terminated prematurely with exit code: {self.mt5_process.returncode}")
+                return False
+
             # Under Wine/Windows, terminal64.exe may fork into a child process and the parent may exit cleanly
             term_proc = self.get_terminal_process()
             if term_proc:
                 self.logger.info(f"Active MT5 terminal process detected (PID: {term_proc.pid})")
+            elif self.mt5_process.poll() is None:
+                self.logger.info(f"Direct MT5 process still active (PID: {self.mt5_process.pid})")
+            else:
+                self.logger.error("No active MT5 terminal process detected after launch.")
+                return False
             return True
         except Exception as e:
             self.logger.error(f"Failed to launch MT5 subprocess: {e}")
             return False
 
     def connect_mt5(self):
-        """Initializes connection to the MT5 terminal instance."""
+        """Initializes connection to the MT5 terminal instance with timeout and retry logic."""
         self.logger.info("Initializing connection via MetaTrader5 API...")
         executable = None
         for name in ["terminal64.exe", "terminal.exe"]:
@@ -387,39 +401,67 @@ class MT5Worker:
             if os.path.isfile(p):
                 executable = p
                 break
-                
-        # Connect to MT5
-        success = mt5.initialize(
-            path=executable, 
-            login=self.login_id, 
-            password=self.password, 
-            server=self.server, 
-            portable=True
-        )
-        
-        if not success:
-            err = mt5.last_error()
-            self.logger.error(f"MetaTrader5 initialization failed: {err}")
+
+        if not executable:
+            self.logger.error("No MT5 terminal executable found in clone directory for API connection.")
             return False
-            
-        self.logger.info("Successfully bound to MetaTrader5 API.")
-        return True
+
+        # Attempt to bind to the terminal with retries and explicit timeout
+        max_attempts = 4
+        timeout_ms = 30000
+
+        for attempt in range(1, max_attempts + 1):
+            self.logger.info(f"Binding to MetaTrader5 API (attempt {attempt}/{max_attempts}, timeout {timeout_ms}ms)...")
+
+            if not self.is_terminal_running():
+                self.logger.error("Terminal process is not running. Aborting API binding attempt.")
+                return False
+
+            try:
+                success = mt5.initialize(
+                    path=executable,
+                    login=self.login_id,
+                    password=self.password,
+                    server=self.server,
+                    timeout=timeout_ms,
+                    portable=True
+                )
+            except Exception as e:
+                self.logger.error(f"Exception during mt5.initialize(): {e}")
+                success = False
+
+            if success:
+                self.logger.info("Successfully bound to MetaTrader5 API.")
+                return True
+            else:
+                err = mt5.last_error()
+                self.logger.warning(f"MetaTrader5 initialization attempt {attempt} failed: {err}")
+                if attempt < max_attempts:
+                    time.sleep(5)
+
+        self.logger.error(f"Failed to bind to MetaTrader5 API after {max_attempts} attempts.")
+        return False
 
     def get_terminal_process(self):
         """Finds any active MT5 terminal process running from this clone directory."""
         try:
+            my_pid = os.getpid()
             clone_dir_abs = os.path.abspath(self.clone_dir).lower()
             clone_name = os.path.basename(self.clone_dir).lower()
             for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
                 try:
+                    if proc.info.get('pid') == my_pid:
+                        continue
                     exe = proc.info.get('exe')
                     if exe and os.path.abspath(exe).lower().startswith(clone_dir_abs):
                         return proc
+                    cmdline = proc.info.get('cmdline') or []
+                    cmdline_str = " ".join(cmdline).lower()
+                    if "worker.py" in cmdline_str:
+                        continue
                     name = (proc.info.get('name') or '').lower()
                     if "terminal" in name or "wine" in name:
-                        cmdline = proc.info.get('cmdline') or []
-                        cmdline_str = " ".join(cmdline).lower()
-                        if clone_dir_abs in cmdline_str or clone_name in cmdline_str:
+                        if ("terminal64.exe" in cmdline_str or "terminal.exe" in cmdline_str) and (clone_dir_abs in cmdline_str or clone_name in cmdline_str):
                             return proc
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     pass
@@ -686,17 +728,22 @@ class MT5Worker:
 
         # 2. Terminate any terminal processes running from this clone directory (handles Wine child/forked processes)
         try:
+            my_pid = os.getpid()
             clone_dir_abs = os.path.abspath(self.clone_dir).lower()
             clone_name = os.path.basename(self.clone_dir).lower()
             for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
                 try:
-                    exe = proc.info.get('exe')
+                    if proc.info.get('pid') == my_pid:
+                        continue
                     cmdline = proc.info.get('cmdline') or []
                     cmdline_str = " ".join(cmdline).lower()
+                    if "worker.py" in cmdline_str:
+                        continue
+                    exe = proc.info.get('exe')
                     name = (proc.info.get('name') or '').lower()
 
                     matches_dir = exe and os.path.abspath(exe).lower().startswith(clone_dir_abs)
-                    matches_cmd = ("terminal" in name or "wine" in name) and (clone_dir_abs in cmdline_str or clone_name in cmdline_str)
+                    matches_cmd = ("terminal" in name or "wine" in name) and ("terminal64.exe" in cmdline_str or "terminal.exe" in cmdline_str) and (clone_dir_abs in cmdline_str or clone_name in cmdline_str)
 
                     if matches_dir or matches_cmd:
                         self.logger.info(f"Terminating cloned MT5 process (PID: {proc.pid})...")
