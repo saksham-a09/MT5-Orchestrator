@@ -345,6 +345,14 @@ class MT5Worker:
                 return False
 
 
+        # Clean up stale temp files or sockets left from previous abruptly terminated instances
+        temp_dir = os.path.join(self.clone_dir, "temp")
+        if os.path.isdir(temp_dir):
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
         creation_flags = 0
         if os.name == "nt" and not is_wine():
             creation_flags = subprocess.CREATE_NEW_CONSOLE
@@ -392,6 +400,39 @@ class MT5Worker:
             self.logger.error(f"Failed to launch MT5 subprocess: {e}")
             return False
 
+    def _log_terminal_diagnostics(self):
+        """Read and log recent lines from MT5 terminal logs and spawn logs to aid diagnosis."""
+        try:
+            logs_dir = os.path.join(self.clone_dir, "logs")
+            if os.path.isdir(logs_dir):
+                log_files = sorted([f for f in os.listdir(logs_dir) if f.endswith(".log") and not f.startswith("metaeditor")])
+                if log_files:
+                    latest_log = os.path.join(logs_dir, log_files[-1])
+                    for enc in ["utf-16le", "utf-8", "cp1252"]:
+                        try:
+                            with open(latest_log, "r", encoding=enc, errors="replace") as f:
+                                lines = [line.strip() for line in f if line.strip()]
+                                recent = lines[-15:]
+                                if recent:
+                                    self.logger.info(f"--- MT5 Internal Log ({os.path.basename(latest_log)}) ---")
+                                    for l in recent:
+                                        self.logger.info(f"  [MT5] {l}")
+                            break
+                        except Exception:
+                            continue
+
+            spawn_log = os.path.join(self.clone_dir, f"worker_{self.login_id}_spawn.log")
+            if os.path.isfile(spawn_log):
+                with open(spawn_log, "r", encoding="utf-8", errors="replace") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                    recent = lines[-15:]
+                    if recent:
+                        self.logger.info(f"--- Wine Spawn Log ({os.path.basename(spawn_log)}) ---")
+                        for l in recent:
+                            self.logger.info(f"  [Wine] {l}")
+        except Exception as e:
+            self.logger.debug(f"Diagnostics reader error: {e}")
+
     def connect_mt5(self):
         """Initializes connection to the MT5 terminal instance with timeout and retry logic."""
         self.logger.info("Initializing connection via MetaTrader5 API...")
@@ -415,31 +456,54 @@ class MT5Worker:
 
             if not self.is_terminal_running():
                 self.logger.error("Terminal process is not running. Aborting API binding attempt.")
+                self._log_terminal_diagnostics()
                 return False
 
+            success = False
+            # Stage 1: Try connecting directly to running terminal IPC without forcing login
+            # (terminal was already started with /config:config.ini)
             try:
                 success = mt5.initialize(
                     path=executable,
-                    login=self.login_id,
-                    password=self.password,
-                    server=self.server,
                     timeout=timeout_ms,
                     portable=True
                 )
+                if not success:
+                    # Stage 2: Fallback with explicit credentials
+                    self.logger.debug("Direct initialize returned False, attempting with credentials...")
+                    success = mt5.initialize(
+                        path=executable,
+                        login=self.login_id,
+                        password=self.password,
+                        server=self.server,
+                        timeout=timeout_ms,
+                        portable=True
+                    )
             except Exception as e:
                 self.logger.error(f"Exception during mt5.initialize(): {e}")
                 success = False
 
             if success:
                 self.logger.info("Successfully bound to MetaTrader5 API.")
+                # Verify account connection status
+                acc = mt5.account_info()
+                if acc is None or acc.login != self.login_id:
+                    self.logger.info(f"Account not active on terminal (current: {acc.login if acc else 'None'}). Logging into {self.login_id}...")
+                    if not mt5.login(self.login_id, password=self.password, server=self.server, timeout=timeout_ms):
+                        err = mt5.last_error()
+                        self.logger.warning(f"mt5.login() failed: {err}")
+                    else:
+                        self.logger.info(f"Successfully logged into MT5 account {self.login_id}.")
                 return True
             else:
                 err = mt5.last_error()
                 self.logger.warning(f"MetaTrader5 initialization attempt {attempt} failed: {err}")
+                self._log_terminal_diagnostics()
                 if attempt < max_attempts:
                     time.sleep(5)
 
         self.logger.error(f"Failed to bind to MetaTrader5 API after {max_attempts} attempts.")
+        self._log_terminal_diagnostics()
         return False
 
     def get_terminal_process(self):
