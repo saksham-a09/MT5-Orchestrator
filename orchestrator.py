@@ -164,6 +164,7 @@ def main():
             
     parser = argparse.ArgumentParser(description="Bhionex MT5 Worker Orchestrator Daemon")
     parser.add_argument("--interval", type=int, help="Override polling interval in seconds")
+    parser.add_argument("--delay", type=int, help="Override stagger delay between worker spawns in seconds")
     args = parser.parse_args()
     
     signal.signal(signal.SIGINT, handle_shutdown)
@@ -185,6 +186,10 @@ def main():
     env_interval = os.environ.get("ORCHESTRATOR_INTERVAL")
     interval = args.interval if args.interval is not None else (int(env_interval) if env_interval else 60)
     
+    env_delay = os.environ.get("WORKER_SPAWN_DELAY")
+    default_delay = 15 if is_wine() else 5
+    spawn_delay = args.delay if args.delay is not None else (int(env_delay) if env_delay else default_delay)
+    
     if not api_key:
         print("Error: BOT_API_KEY is not defined in .env or system environment.")
         sys.exit(1)
@@ -201,10 +206,11 @@ def main():
     template_path = os.path.normpath(os.path.join(script_dir, "example.ini"))
     
     print(f"Orchestrator settings:")
-    print(f"  API Base URL:      {api_base}")
-    print(f"  Master MT5 Dir:    {master_mt5}")
-    print(f"  Clients Dir:       {clients_dir}")
-    print(f"  Sync Interval:     {interval} seconds\n")
+    print(f"  API Base URL:        {api_base}")
+    print(f"  Master MT5 Dir:      {master_mt5}")
+    print(f"  Clients Dir:         {clients_dir}")
+    print(f"  Sync Interval:       {interval} seconds")
+    print(f"  Worker Spawn Delay:  {spawn_delay} seconds\n")
     
     global_cleanup(clients_dir_name)
     
@@ -331,6 +337,12 @@ def main():
                     "process": proc,
                     "config": config
                 }
+                if spawn_delay > 0:
+                    print(f"  [~] Stagger delay: waiting {spawn_delay}s before next worker spawn...")
+                    for _ in range(spawn_delay):
+                        if not is_running:
+                            break
+                        time.sleep(1)
             else:
                 tracked = running_workers[login_id]
                 proc = tracked["process"]
@@ -351,6 +363,12 @@ def main():
                         "process": new_proc,
                         "config": config
                     }
+                    if spawn_delay > 0:
+                        print(f"  [~] Stagger delay: waiting {spawn_delay}s before next worker spawn...")
+                        for _ in range(spawn_delay):
+                            if not is_running:
+                                break
+                            time.sleep(1)
                 else:
                     if proc.poll() is not None:
                         print(f"  [!] Worker for {config['email']} (Login: {login_id}) died unexpectedly (Exit Code: {proc.returncode}). Restarting...")
@@ -358,6 +376,12 @@ def main():
                         kill_processes_for_login(login_id, clients_dir_name)
                         new_proc = spawn_worker(login_id, config)
                         running_workers[login_id]["process"] = new_proc
+                        if spawn_delay > 0:
+                            print(f"  [~] Stagger delay: waiting {spawn_delay}s before next worker spawn...")
+                            for _ in range(spawn_delay):
+                                if not is_running:
+                                    break
+                                time.sleep(1)
                         
         orphans = []
         for login_id in list(running_workers.keys()):
