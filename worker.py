@@ -377,15 +377,10 @@ class MT5Worker:
             self.logger.info(f"MT5 terminal process spawned (PID: {self.mt5_process.pid})")
             
             # Allow time for MT5 to start up (Wine needs more time than Windows)
-            startup_wait = 15 if is_wine() else 5
+            startup_wait = 25 if is_wine() else 15
             self.logger.info(f"Waiting {startup_wait}s for MT5 terminal startup...")
             time.sleep(startup_wait)
             
-            # Check if process died immediately
-            if self.mt5_process.poll() is not None:
-                self.logger.error(f"MT5 terminal process terminated prematurely with exit code: {self.mt5_process.returncode}")
-                return False
-
             # Under Wine/Windows, terminal64.exe may fork into a child process and the parent may exit cleanly
             term_proc = self.get_terminal_process()
             if term_proc:
@@ -393,8 +388,9 @@ class MT5Worker:
             elif self.mt5_process.poll() is None:
                 self.logger.info(f"Direct MT5 process still active (PID: {self.mt5_process.pid})")
             else:
-                self.logger.error("No active MT5 terminal process detected after launch.")
+                self.logger.error(f"MT5 terminal process terminated prematurely with exit code: {self.mt5_process.returncode} and no child process found.")
                 return False
+
             return True
         except Exception as e:
             self.logger.error(f"Failed to launch MT5 subprocess: {e}")
