@@ -78,13 +78,18 @@ def kill_processes_for_login(login_id, clients_dir_name):
                 continue
 
             name = proc.name()
-            cmdline = proc.cmdline()
+            if not name:
+                continue
+                
+            name_lower = name.lower()
+            if not ("python" in name_lower or "wine" in name_lower or "terminal64.exe" in name_lower or "terminal.exe" in name_lower):
+                continue
 
-            if not name or not cmdline:
+            cmdline = proc.cmdline()
+            if not cmdline:
                 continue
                 
             cmdline_str = " ".join(cmdline).lower()
-            name_lower = name.lower()
 
             # Check for python worker
             if ("python" in name_lower or "wine" in name_lower) and "worker.py" in cmdline_str and f"--login {login_id}" in cmdline_str:
@@ -116,13 +121,18 @@ def global_cleanup(clients_dir_name):
                 continue
 
             name = proc.name()
-            cmdline = proc.cmdline()
+            if not name:
+                continue
+                
+            name_lower = name.lower()
+            if not ("python" in name_lower or "wine" in name_lower or "terminal64.exe" in name_lower or "terminal.exe" in name_lower):
+                continue
 
-            if not name or not cmdline:
+            cmdline = proc.cmdline()
+            if not cmdline:
                 continue
 
             cmdline_str = " ".join(cmdline).lower()
-            name_lower = name.lower()
 
             is_worker = ("python" in name_lower or "wine" in name_lower) and "worker.py" in cmdline_str
             is_terminal = ("terminal64.exe" in name_lower or "terminal.exe" in name_lower or "wine" in name_lower) and (clients_dir_name.lower() in cmdline_str or "clone_" in cmdline_str)
@@ -326,9 +336,12 @@ def main():
                         stderr=log_file,
                         creationflags=creation_flags
                     )
+                    log_file.close()
                     return p
                 except Exception as e:
                     print(f"  [!] Failed to spawn worker subprocess: {e}")
+                    if 'log_file' in locals() and not log_file.closed:
+                        log_file.close()
                     return None
                 
             if login_id not in running_workers:
