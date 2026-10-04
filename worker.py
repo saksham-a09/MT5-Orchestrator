@@ -804,38 +804,11 @@ class MT5Worker:
                 
         if new_balance_ops > 0:
             self._save_reported_balance_tickets()
-            self.logger.info(f"Detected {new_balance_ops} new balance operation(s). Triggering account summary sync.")
-            # self.sync_account_status(is_connected=True)
+            self.logger.info(f"Detected {new_balance_ops} new balance operation(s).")
 
     def sync_account_status(self, is_connected):
-        """Sends account metrics summary to the Bhionex API."""
-        self.logger.info("Reporting account summary...")
-        acc_info = mt5.account_info()
-        
-        status_payload = {
-            "userId": self.user_id,
-            "scriptCode": self.script_code,
-            "mt5AccountStatus": "connected" if is_connected else "disconnected"
-        }
-        
-        if is_connected and acc_info:
-            status_payload.update({
-                "currentBalance": acc_info.balance,
-                "investedAmount": max(0.0, acc_info.equity - acc_info.balance) if acc_info.equity > acc_info.balance else 0.0,
-                "lastSyncAt": datetime.datetime.now(datetime.timezone.utc).isoformat()
-            })
-        else:
-            status_payload.update({
-                "currentBalance": 0.0,
-                "investedAmount": 0.0,
-                "lastSyncAt": datetime.datetime.now(datetime.timezone.utc).isoformat()
-            })
-            
-        res = self._send_api_post("/api/bot/trading-summary", status_payload)
-        if res.get("success"):
-            self.logger.info("Account summary successfully synced.")
-        else:
-            self.logger.error(f"Failed to sync account summary: {res.get('message')}")
+        """Account status API sync is disabled."""
+        return
 
     def monitor_loop(self):
         """Main loop managing terminal state and calling checks."""
@@ -881,7 +854,6 @@ class MT5Worker:
                     continue
                     
                 if connected != self.last_connected_status:
-                    # self.sync_account_status(is_connected=connected)
                     self.last_connected_status = connected
                     
                 if connected:
