@@ -6,6 +6,7 @@ import time
 import signal
 import argparse
 import subprocess
+import threading
 import psutil
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -151,6 +152,42 @@ def global_cleanup(clients_dir_name):
 
 running_workers = {}
 is_running = True
+validator_server = None
+
+
+def start_validator_server(host="0.0.0.0", port=5001, threads=4):
+    """Start the Validator API WSGI server in a background daemon thread."""
+    global validator_server
+    try:
+        from validator_api import app as validator_app
+    except ImportError as e:
+        print(f"  [!] Failed to import validator_api: {e}")
+        return None
+
+    try:
+        from waitress.server import create_server
+        server = create_server(validator_app, host=host, port=port, threads=threads)
+        validator_server = server
+        t = threading.Thread(target=server.run, daemon=True, name="ValidatorApiServer")
+        t.start()
+        print(f"  [+] Embedded Validator API active on http://{host}:{port} (Waitress WSGI, Threads: {threads})")
+        return server
+    except ImportError:
+        def run_flask():
+            validator_app.run(host=host, port=port, use_reloader=False, threaded=True)
+
+        t = threading.Thread(target=run_flask, daemon=True, name="ValidatorApiServer")
+        t.start()
+        print(f"  [+] Embedded Validator API active on http://{host}:{port} (Flask Dev Server)")
+        return t
+    except OSError as e:
+        print(f"  [!] Could not bind Validator API on port {port}: {e}")
+        print(f"      Check if another process (e.g. standalone validator_api) is already using port {port}.")
+        return None
+    except Exception as e:
+        print(f"  [!] Failed to initialize Validator API server: {e}")
+        return None
+
 
 def handle_shutdown(signum, frame):
     global is_running
@@ -175,6 +212,8 @@ def main():
     parser = argparse.ArgumentParser(description="Bhionex MT5 Worker Orchestrator Daemon")
     parser.add_argument("--interval", type=int, help="Override polling interval in seconds")
     parser.add_argument("--delay", type=int, help="Override stagger delay between worker spawns in seconds")
+    parser.add_argument("--validator-port", type=int, help="Override Validator API port (default: 5001 or from .env)")
+    parser.add_argument("--no-validator", action="store_true", help="Disable embedded Validator API server")
     args = parser.parse_args()
     
     signal.signal(signal.SIGINT, handle_shutdown)
@@ -199,6 +238,11 @@ def main():
     env_delay = os.environ.get("WORKER_SPAWN_DELAY")
     default_delay = 15 if is_wine() else 5
     spawn_delay = args.delay if args.delay is not None else (int(env_delay) if env_delay else default_delay)
+
+    env_validator_port = os.environ.get("VALIDATOR_PORT", "5001")
+    validator_port = args.validator_port if args.validator_port is not None else int(env_validator_port)
+    validator_threads = int(os.environ.get("VALIDATOR_THREADS", 4))
+    enable_validator = not args.no_validator and os.environ.get("ENABLE_VALIDATOR", "true").lower() not in ["false", "0", "no"]
     
     if not api_key:
         print("Error: BOT_API_KEY is not defined in .env or system environment.")
@@ -220,9 +264,17 @@ def main():
     print(f"  Master MT5 Dir:      {master_mt5}")
     print(f"  Clients Dir:         {clients_dir}")
     print(f"  Sync Interval:       {interval} seconds")
-    print(f"  Worker Spawn Delay:  {spawn_delay} seconds\n")
+    print(f"  Worker Spawn Delay:  {spawn_delay} seconds")
+    if enable_validator:
+        print(f"  Validator API:       Enabled (Port: {validator_port})")
+    else:
+        print(f"  Validator API:       Disabled")
+    print()
     
     global_cleanup(clients_dir_name)
+
+    if enable_validator:
+        start_validator_server(host="0.0.0.0", port=validator_port, threads=validator_threads)
     
     print("\nOrchestrator successfully started. Entering main loop...")
     
@@ -417,6 +469,13 @@ def main():
     for login_id in list(running_workers.keys()):
         kill_processes_for_login(login_id, clients_dir_name)
         del running_workers[login_id]
+
+    if validator_server:
+        try:
+            print("Stopping Validator API server...")
+            validator_server.close()
+        except Exception:
+            pass
         
     print("Orchestrator shutdown complete. Exiting.")
 

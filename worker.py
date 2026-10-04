@@ -288,7 +288,7 @@ class MT5Worker:
                         symbol=self.symbol,
                         period=self.timeframe
                     )
-                    
+                    Print(updated_content)
                     dest_ini_path = os.path.join(self.clone_dir, "config.ini")
                     with open(dest_ini_path, "w", encoding="utf-8") as f:
                         f.write(updated_content)

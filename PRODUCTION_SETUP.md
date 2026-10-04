@@ -6,9 +6,9 @@ This document provides step-by-step instructions to set up, configure, and maint
 
 ## 1. System Architecture Overview
 
-The system consists of two primary services:
-1. **MT5 Orchestrator Daemon (`orchestrator.py`)**: Periodically polls the Bhionex API for active user subscriptions, automatically clones MetaTrader 5 terminal instances, and manages background `worker.py` processes for each user.
-2. **MT5 Validator API (`validator_api.py`)**: A production WSGI (Waitress) HTTP service providing an endpoint to test and validate MT5 account credentials synchronously using temporary MT5 clone instances.
+The system consists of:
+1. **MT5 Orchestrator Daemon (`orchestrator.py`)**: Periodically polls the Bhionex API for active user subscriptions, automatically clones MetaTrader 5 terminal instances, and manages background `worker.py` processes for each user. It also automatically embeds and serves the **MT5 Validator API** on port 5001.
+2. **MT5 Validator API (`validator_api.py`)**: A production WSGI (Waitress) HTTP service providing endpoints (`/` and `/validate`) to test and validate MT5 account credentials synchronously using temporary MT5 clone instances. Runs embedded inside `orchestrator.py` by default, or independently as a standalone service.
 
 ### Why Wine + Xvfb?
 MetaTrader 5 (`terminal64.exe`) and the official `MetaTrader5` Python package rely on Windows APIs. Running this stack on a headless Linux server requires:
@@ -115,7 +115,7 @@ Clone or copy the project code to `/opt/mt5-remote-api`:
 
 ```bash
 sudo mkdir -p /opt/mt5-remote-api
-# Copy orchestrator.py, worker.py, validator_api.py, mt5_validator_task.py, example.ini, requirements.txt, etc.
+# Copy orchestrator.py, worker.py, validator_api.py, example.ini, requirements.txt, etc.
 cd /opt/mt5-remote-api
 
 # Upgrade pip and install required packages inside Wine Python
@@ -164,6 +164,8 @@ EOF
 ## 4. systemd Service Setup
 
 Setting up `systemd` services guarantees automatic startup on boot, process supervision, auto-restarts, and central logging.
+
+> **Note**: Because `orchestrator.py` automatically embeds and serves the Validator API on port 5001, you only need to run **Service 1 (`mt5-orchestrator.service`)**. Service 2 is optional for decoupled setups.
 
 ### Service 1: MT5 Orchestrator (`mt5-orchestrator.service`)
 
