@@ -147,6 +147,7 @@ class MT5Worker:
         self.last_connected_status = None
         self.reported_balance_tickets_file = os.path.join(self.clone_dir, "reported_balance_tickets.json")
         self.reported_balance_tickets = self._load_reported_balance_tickets()
+        self.symbol_cache_file = os.path.join(self.clone_dir, "symbol_info.json")
         
         self.mt5_process = None
         self.stop_event = threading.Event()
@@ -246,10 +247,176 @@ class MT5Worker:
                 return True
         return False
 
+    def _get_executable(self):
+        """Locates or copies the MT5 terminal executable in the clone directory."""
+        for name in ["terminal64.exe", "terminal.exe"]:
+            p = os.path.join(self.clone_dir, name)
+            if os.path.isfile(p):
+                return p
+
+        if os.path.isfile(self.terminal_path):
+            shutil_dest = os.path.join(self.clone_dir, os.path.basename(self.terminal_path))
+            try:
+                shutil.copy2(self.terminal_path, shutil_dest)
+                self.logger.info(f"Copied terminal executable to {shutil_dest}")
+                return shutil_dest
+            except Exception as e:
+                self.logger.error(f"Failed to copy terminal executable to clone dir: {e}")
+                return None
+        return None
+
+    def _match_symbol(self, target_symbol, symbols):
+        """Matches a target symbol name (e.g. XAUUSD) against the broker's available symbols.
+        
+        Handles:
+        1. Exact matches (case-insensitive)
+        2. Prefix/suffix matches (e.g. XAUUSDm, XAUUSD.r, XAUUSD_i, XAUUSD+)
+        3. Currency-based matching (e.g. base=XAU, profit=USD -> GOLD, GOLDm, GOLD.ecn)
+        4. Description/path matching ("Gold vs US Dollar")
+        
+        Prioritizes active/tradeable symbols over disabled/archived symbols.
+        """
+        if not symbols:
+            return target_symbol
+
+        target_upper = target_symbol.strip().upper()
+
+        def is_tradeable(s):
+            # In MT5: 0 is SYMBOL_TRADE_MODE_DISABLED
+            return getattr(s, "trade_mode", 1) != 0
+
+        # Tier 1: Exact match
+        for s in symbols:
+            if s.name.upper() == target_upper and is_tradeable(s):
+                return s.name
+
+        # Tier 2: Suffix / Prefix match (e.g. XAUUSDm, XAUUSD.r, XAUUSD_i)
+        candidates = [s for s in symbols if target_upper in s.name.upper()]
+        if candidates:
+            candidates.sort(key=lambda s: (not is_tradeable(s), len(s.name)))
+            return candidates[0].name
+
+        # Tier 3: Currency pair match
+        target_base = "XAU" if "XAU" in target_upper else (target_upper[:3] if len(target_upper) >= 6 else target_upper)
+        target_profit = "USD" if "USD" in target_upper else (target_upper[3:6] if len(target_upper) >= 6 else "")
+
+        currency_matches = []
+        for s in symbols:
+            s_base = getattr(s, "currency_base", "").upper()
+            s_profit = getattr(s, "currency_profit", "").upper()
+            if s_base == target_base and (not target_profit or s_profit == target_profit):
+                currency_matches.append(s)
+
+        if currency_matches:
+            currency_matches.sort(key=lambda s: (not is_tradeable(s), len(s.name)))
+            return currency_matches[0].name
+
+        # Tier 4: Description / Path fallback
+        desc_matches = []
+        for s in symbols:
+            desc = getattr(s, "description", "").upper()
+            path = getattr(s, "path", "").upper()
+            profit = getattr(s, "currency_profit", "").upper()
+            if ("GOLD" in desc or "GOLD" in path) and ("USD" in desc or "USD" in profit):
+                desc_matches.append(s)
+
+        if desc_matches:
+            desc_matches.sort(key=lambda s: (not is_tradeable(s), len(s.name)))
+            return desc_matches[0].name
+
+        return target_symbol
+
+    def resolve_symbol(self, executable):
+        """Resolves the broker-specific symbol name for self.symbol using local cache or a probe."""
+        # 1. Check local cache
+        if os.path.isfile(self.symbol_cache_file):
+            try:
+                with open(self.symbol_cache_file, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+
+                cached_target = cache_data.get("target_symbol")
+                cached_resolved = cache_data.get("resolved_symbol")
+                cached_server = cache_data.get("server")
+                cached_login = cache_data.get("login")
+
+                if (cached_target == self.symbol and
+                    cached_resolved and
+                    str(cached_login) == str(self.login_id) and
+                    str(cached_server).lower() == str(self.server).lower()):
+                    self.logger.info(f"Using cached broker symbol: '{cached_resolved}' (target: '{self.symbol}')")
+                    self.symbol = cached_resolved
+                    return cached_resolved
+            except Exception as e:
+                self.logger.warning(f"Failed to read symbol cache: {e}")
+
+        # 2. Probe broker via temporary headless MT5 connection
+        self.logger.info(f"Probing broker server '{self.server}' to resolve target symbol '{self.symbol}'...")
+
+        probe_success = False
+        try:
+            probe_success = mt5.initialize(
+                path=executable,
+                login=self.login_id,
+                password=self.password,
+                server=self.server,
+                timeout=15000,
+                portable=True
+            )
+        except Exception as e:
+            self.logger.warning(f"Exception during symbol probe initialize: {e}")
+            probe_success = False
+
+        if not probe_success:
+            err = mt5.last_error()
+            self.logger.warning(f"Headless symbol probe failed ({err}). Proceeding with default symbol '{self.symbol}'.")
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            return self.symbol
+
+        resolved_symbol = self.symbol
+        try:
+            all_symbols = mt5.symbols_get()
+            if all_symbols:
+                resolved_symbol = self._match_symbol(self.symbol, all_symbols)
+                self.logger.info(f"Symbol probe successful: '{self.symbol}' -> '{resolved_symbol}'")
+                try:
+                    mt5.symbol_select(resolved_symbol, True)
+                except Exception:
+                    pass
+            else:
+                self.logger.warning("Symbol probe connected but mt5.symbols_get() returned no symbols.")
+        except Exception as e:
+            self.logger.error(f"Error while matching broker symbols during probe: {e}")
+        finally:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            time.sleep(2)
+            self.kill_process()
+
+        # 3. Save to cache
+        try:
+            cache_payload = {
+                "target_symbol": self.symbol,
+                "resolved_symbol": resolved_symbol,
+                "server": self.server,
+                "login": self.login_id,
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            with open(self.symbol_cache_file, "w", encoding="utf-8") as f:
+                json.dump(cache_payload, f, indent=2)
+            self.logger.info(f"Saved symbol cache to {self.symbol_cache_file}")
+        except Exception as e:
+            self.logger.warning(f"Failed to write symbol cache file: {e}")
+
+        self.symbol = resolved_symbol
+        return resolved_symbol
+
     def launch_mt5(self):
         """Starts the MT5 terminal process in portable mode."""
-
-
         if not self._has_executable():
             master_dir = os.path.dirname(self.terminal_path)
             self.logger.info(f"Clone directory {self.clone_dir} does not contain terminal executable. Cloning structure from master: {master_dir}")
@@ -272,10 +439,18 @@ class MT5Worker:
                 self.logger.error(f"Failed to clone master MT5 directory to clone dir: {e}")
                 return False
 
+        executable = self._get_executable()
+        if not executable:
+            self.logger.error("No valid MT5 terminal executable found in clone or master path.")
+            return False
+
+        # Resolve broker-specific symbol before generating config.ini
+        self.resolve_symbol(executable)
+
         if self.config_template_path:
             if os.path.exists(self.config_template_path):
                 try:
-                    self.logger.info(f"Updating config.ini from template: {self.config_template_path}")
+                    self.logger.info(f"Updating config.ini from template: {self.config_template_path} (Symbol: {self.symbol})")
                     with open(self.config_template_path, "r", encoding="utf-8") as f:
                         template_content = f.read()
                     
@@ -288,7 +463,6 @@ class MT5Worker:
                         symbol=self.symbol,
                         period=self.timeframe
                     )
-                    Print(updated_content)
                     dest_ini_path = os.path.join(self.clone_dir, "config.ini")
                     with open(dest_ini_path, "w", encoding="utf-8") as f:
                         f.write(updated_content)
@@ -322,29 +496,6 @@ class MT5Worker:
                 except Exception as e:
                     self.logger.error(f"Failed to clear charts in {profile_dir}: {e}")
 
-        self.logger.info(f"Launching MT5 terminal: {self.terminal_path}")
-        executable = None
-        for name in ["terminal64.exe", "terminal.exe"]:
-            p = os.path.join(self.clone_dir, name)
-            if os.path.isfile(p):
-                executable = p
-                break
-        
-        if not executable:
-            if os.path.isfile(self.terminal_path):
-                shutil_dest = os.path.join(self.clone_dir, os.path.basename(self.terminal_path))
-                try:
-                    shutil.copy2(self.terminal_path, shutil_dest)
-                    executable = shutil_dest
-                    self.logger.info(f"Copied terminal executable to {executable}")
-                except Exception as e:
-                    self.logger.error(f"Failed to copy terminal executable to clone dir: {e}")
-                    return False
-            else:
-                self.logger.error("No valid MT5 terminal executable found in clone or master path.")
-                return False
-
-
         # Clean up stale temp files or sockets left from previous abruptly terminated instances
         temp_dir = os.path.join(self.clone_dir, "temp")
         if os.path.isdir(temp_dir):
@@ -353,6 +504,7 @@ class MT5Worker:
             except Exception:
                 pass
 
+        self.logger.info(f"Launching MT5 terminal: {executable}")
         creation_flags = 0
         if os.name == "nt" and not is_wine():
             creation_flags = subprocess.CREATE_NEW_CONSOLE
@@ -432,12 +584,7 @@ class MT5Worker:
     def connect_mt5(self):
         """Initializes connection to the MT5 terminal instance with timeout and retry logic."""
         self.logger.info("Initializing connection via MetaTrader5 API...")
-        executable = None
-        for name in ["terminal64.exe", "terminal.exe"]:
-            p = os.path.join(self.clone_dir, name)
-            if os.path.isfile(p):
-                executable = p
-                break
+        executable = self._get_executable()
 
         if not executable:
             self.logger.error("No MT5 terminal executable found in clone directory for API connection.")
