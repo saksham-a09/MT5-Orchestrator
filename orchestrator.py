@@ -236,7 +236,7 @@ def main():
     interval = args.interval if args.interval is not None else (int(env_interval) if env_interval else 60)
     
     env_delay = os.environ.get("WORKER_SPAWN_DELAY")
-    default_delay = 15 if is_wine() else 5
+    default_delay = 0 if is_wine() else 5
     spawn_delay = args.delay if args.delay is not None else (int(env_delay) if env_delay else default_delay)
 
     env_validator_port = os.environ.get("VALIDATOR_PORT", "5001")
