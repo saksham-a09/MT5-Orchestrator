@@ -113,6 +113,7 @@ bool HttpQueryInfoW(
 
 #define HTTP_QUERY_STATUS_CODE                  19
 #define HTTP_QUERY_FLAG_NUMBER                  0x20000000
+#define CP_UTF16                                1200
 
 //--- Input Parameters
 input group "=== Server Configuration ==="
@@ -490,8 +491,17 @@ bool HttpRequestDLL(const string method, const string endpoint, const string pos
       uint strIdx = 0;
       if(HttpQueryInfoW(hRequest, HTTP_QUERY_STATUS_CODE, strBuf, strLen, strIdx))
       {
-         string codeStr = CharArrayToString(strBuf, 0, strLen, CP_UTF16);
-         httpStatus = (int)StringToInteger(codeStr);
+         string codeStr = "";
+         for(uint i = 0; i + 1 < strLen; i += 2)
+         {
+            ushort ch = (ushort)(strBuf[i] | (strBuf[i + 1] << 8));
+            if(ch >= '0' && ch <= '9')
+               codeStr += ShortToString(ch);
+            else if(ch == 0)
+               break;
+         }
+         if(StringLen(codeStr) > 0)
+            httpStatus = (int)StringToInteger(codeStr);
       }
    }
 
