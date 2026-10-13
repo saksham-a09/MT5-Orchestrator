@@ -13,14 +13,111 @@
 #include <Trade\SymbolInfo.mqh>
 #include <Trade\PositionInfo.mqh>
 
-// NOTE: This EA uses MT5's built-in WebRequest() for HTTP — cross-platform (Windows & Linux/Wine).
-// You MUST whitelist the server URL under:
-//   Tools → Options → Expert Advisors → Allow WebRequest for listed URL
-// Add your relay server URL, e.g.: http://127.0.0.1:8000
+// NOTE: This EA supports Windows WinINet API (wininet.dll) to bypass the MT5 WebRequest URL whitelisting requirement.
+// It is fully compatible with native 64-bit Windows and Linux/Wine environments (which provides built-in wininet.dll.so).
+// To use DLL mode, ensure "Allow DLL imports" is enabled in MT5: Tools → Options → Expert Advisors.
+// Alternatively, setting InpUseDLL=false falls back to standard MT5 native WebRequest().
+
+//+------------------------------------------------------------------+
+//| Windows WinINet API Declarations (64-bit MT5 & Linux Wine)       |
+//| Bypasses MT5 WebRequest URL whitelisting requirement             |
+//+------------------------------------------------------------------+
+#import "wininet.dll"
+ulong InternetOpenW(
+   string  sAgent,
+   uint    lAccessType,
+   string  sProxyName,
+   string  sProxyBypass,
+   uint    lFlags
+);
+
+ulong InternetConnectW(
+   ulong   hInternet,
+   string  sServerName,
+   ushort  nServerPort,
+   string  sUsername,
+   string  sPassword,
+   uint    lService,
+   uint    lFlags,
+   ulong   lContext
+);
+
+ulong HttpOpenRequestW(
+   ulong   hConnect,
+   string  sVerb,
+   string  sObjectName,
+   string  sVersion,
+   string  sReferer,
+   ulong   lpszAcceptTypes,
+   uint    lFlags,
+   ulong   lContext
+);
+
+bool HttpSendRequestW(
+   ulong   hRequest,
+   string  sHeaders,
+   uint    lHeadersLength,
+   uchar   &lpOptional[],
+   uint    lOptionalLength
+);
+
+bool InternetReadFile(
+   ulong   hFile,
+   uchar   &sBuffer[],
+   uint    lNumBytesToRead,
+   uint    &lNumberOfBytesRead
+);
+
+bool InternetCloseHandle(
+   ulong   hInet
+);
+
+bool InternetSetOptionW(
+   ulong   hInternet,
+   uint    lOption,
+   uint    &lpBuffer[],
+   uint    lBufferLength
+);
+
+bool HttpQueryInfoW(
+   ulong   hRequest,
+   uint    lInfoLevel,
+   uchar   &lpvBuffer[],
+   uint    &lpdwBufferLength,
+   uint    &lpdwIndex
+);
+#import
+
+//--- WinINet Constants
+#define INTERNET_OPEN_TYPE_DIRECT               1
+#define INTERNET_OPEN_TYPE_PRECONFIG            0
+#define INTERNET_SERVICE_HTTP                   3
+
+#define INTERNET_FLAG_RELOAD                    0x80000000
+#define INTERNET_FLAG_NO_CACHE_WRITE            0x04000000
+#define INTERNET_FLAG_PRAGMA_NOCACHE            0x00000100
+#define INTERNET_FLAG_SECURE                    0x00800000
+#define INTERNET_FLAG_KEEP_CONNECTION           0x00400000
+#define INTERNET_FLAG_IGNORE_CERT_CN_INVALID    0x00001000
+#define INTERNET_FLAG_IGNORE_CERT_DATE_INVALID  0x00002000
+
+#define INTERNET_OPTION_CONNECT_TIMEOUT         2
+#define INTERNET_OPTION_SEND_TIMEOUT            5
+#define INTERNET_OPTION_RECEIVE_TIMEOUT         6
+#define INTERNET_OPTION_SECURITY_FLAGS          31
+
+#define SECURITY_FLAG_IGNORE_UNKNOWN_CA         0x00000100
+#define SECURITY_FLAG_IGNORE_WRONG_USAGE        0x00000200
+#define SECURITY_FLAG_IGNORE_CERT_CN_INVALID    0x00001000
+#define SECURITY_FLAG_IGNORE_CERT_DATE_INVALID  0x00002000
+
+#define HTTP_QUERY_STATUS_CODE                  19
+#define HTTP_QUERY_FLAG_NUMBER                  0x20000000
 
 //--- Input Parameters
 input group "=== Server Configuration ==="
 input string   InpServerURL        = "http://127.0.0.1:8000"; // Python Relay Server URL
+input bool     InpUseDLL           = true;                    // Use WinINet DLL (bypasses URL whitelisting)
 input string   InpClientID         = "AUTO";                  // Client ID ("AUTO" uses Account Login)
 string   InpAuthToken        = "";                      // Shared Webhook Authorization Token
 int      InpPollTimeoutSec   = 20;                      // Long-Poll Timeout (Seconds)
@@ -79,7 +176,21 @@ int OnInit()
    if(InpShowDashboard)
       CreateDashboard();
 
-   PrintFormat("[EA Init] TradingView Relay Client started. Client ID: %s | Server: %s", ExtClientID, InpServerURL);
+   if(InpUseDLL)
+   {
+      if(MQLInfoInteger(MQL_DLLS_ALLOWED))
+         PrintFormat("[EA Init] TradingView Relay Client started. Client ID: %s | Server: %s | Transport: WinINet DLL (URL Whitelist Bypassed)", ExtClientID, InpServerURL);
+      else
+      {
+         PrintFormat("[EA Warning] InpUseDLL=true but 'Allow DLL imports' is disabled in MT5 settings! Falling back to WebRequest. Please enable DLL imports in Tools->Options->Expert Advisors.");
+         ExtStatusText = "DLL imports disabled in MT5";
+      }
+   }
+   else
+   {
+      PrintFormat("[EA Init] TradingView Relay Client started. Client ID: %s | Server: %s | Transport: Native WebRequest", ExtClientID, InpServerURL);
+   }
+
    return(INIT_SUCCEEDED);
 }
 
@@ -116,39 +227,343 @@ void OnTimer()
 }
 
 //+------------------------------------------------------------------+
-//| Helper: MT5 Native WebRequest (cross-platform: Windows & Linux)  |
+//| Helper: Parse full URL into Scheme, Host, Port, and Path         |
+//+------------------------------------------------------------------+
+bool ParseURL(const string fullUrl, bool &isHttps, string &outHost, ushort &outPort, string &outPath)
+{
+   isHttps = false;
+   outHost = "";
+   outPort = 80;
+   outPath = "/";
+
+   string url = fullUrl;
+   StringTrimLeft(url);
+   StringTrimRight(url);
+
+   if(StringLen(url) == 0)
+      return false;
+
+   // 1. Detect protocol scheme
+   string urlLower = url;
+   StringToLower(urlLower);
+
+   int schemeEnd = 0;
+   if(StringFind(urlLower, "https://") == 0)
+   {
+      isHttps = true;
+      outPort = 443;
+      schemeEnd = 8;
+   }
+   else if(StringFind(urlLower, "http://") == 0)
+   {
+      isHttps = false;
+      outPort = 80;
+      schemeEnd = 7;
+   }
+
+   string remainder = StringSubstr(url, schemeEnd);
+   if(StringLen(remainder) == 0)
+      return false;
+
+   // 2. Separate host:port from path
+   int pathStart = StringFind(remainder, "/");
+   string hostPart = "";
+   if(pathStart >= 0)
+   {
+      hostPart = StringSubstr(remainder, 0, pathStart);
+      outPath = StringSubstr(remainder, pathStart);
+   }
+   else
+   {
+      hostPart = remainder;
+      outPath = "/";
+   }
+
+   // 3. Extract port from host if present
+   int colonPos = StringFind(hostPart, ":");
+   if(colonPos >= 0)
+   {
+      outHost = StringSubstr(hostPart, 0, colonPos);
+      string portStr = StringSubstr(hostPart, colonPos + 1);
+      int customPort = (int)StringToInteger(portStr);
+      if(customPort > 0 && customPort <= 65535)
+         outPort = (ushort)customPort;
+   }
+   else
+   {
+      outHost = hostPart;
+   }
+
+   StringTrimLeft(outHost);
+   StringTrimRight(outHost);
+
+   return (StringLen(outHost) > 0);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: WinINet DLL HTTP Request (Bypasses URL Whitelisting)     |
+//| Fully cross-platform: Windows 64-bit and Linux Wine environments |
+//+------------------------------------------------------------------+
+bool HttpRequestDLL(const string method, const string endpoint, const string postData, string &outResponse, int &outCode)
+{
+   outCode     = -1;
+   outResponse = "";
+
+   string fullUrl = InpServerURL;
+   if(StringLen(fullUrl) > 0 && StringGetCharacter(fullUrl, StringLen(fullUrl)-1) == '/')
+      fullUrl = StringSubstr(fullUrl, 0, StringLen(fullUrl)-1);
+
+   if(StringLen(endpoint) > 0 && StringGetCharacter(endpoint, 0) != '/')
+      fullUrl += "/" + endpoint;
+   else
+      fullUrl += endpoint;
+
+   bool isHttps = false;
+   string host = "";
+   ushort port = 80;
+   string path = "/";
+
+   if(!ParseURL(fullUrl, isHttps, host, port, path))
+   {
+      ExtStatusText = "Invalid Server URL";
+      PrintFormat("[EA WinINet Error] Failed to parse URL: %s", fullUrl);
+      return false;
+   }
+
+   // 1. Initialize WinINet session
+   ulong hSession = InternetOpenW(
+      "TradingViewRelay/2.0 (MT5; 64-bit; WinINet)",
+      INTERNET_OPEN_TYPE_DIRECT,
+      NULL,
+      NULL,
+      0
+   );
+
+   if(hSession == 0)
+   {
+      int err = GetLastError();
+      ExtStatusText = StringFormat("InternetOpenW failed (err=%d)", err);
+      PrintFormat("[EA WinINet Error] InternetOpenW failed (err=%d)", err);
+      return false;
+   }
+
+   // Configure timeouts
+   uint connTimeout[1];
+   connTimeout[0] = 5000; // 5s connect timeout
+   InternetSetOptionW(hSession, INTERNET_OPTION_CONNECT_TIMEOUT, connTimeout, 4);
+
+   uint rcvTimeout[1];
+   rcvTimeout[0] = (uint)((InpPollTimeoutSec + 5) * 1000); // Polling timeout + buffer
+   InternetSetOptionW(hSession, INTERNET_OPTION_RECEIVE_TIMEOUT, rcvTimeout, 4);
+
+   uint sndTimeout[1];
+   sndTimeout[0] = 5000; // 5s send timeout
+   InternetSetOptionW(hSession, INTERNET_OPTION_SEND_TIMEOUT, sndTimeout, 4);
+
+   uint startTick = GetTickCount();
+
+   // 2. Connect to server
+   ulong hConnect = InternetConnectW(
+      hSession,
+      host,
+      port,
+      NULL,
+      NULL,
+      INTERNET_SERVICE_HTTP,
+      0,
+      0
+   );
+
+   if(hConnect == 0)
+   {
+      int err = GetLastError();
+      InternetCloseHandle(hSession);
+      ExtLastPingMS = (int)(GetTickCount() - startTick);
+      ExtStatusText = StringFormat("WinINet connect failed (err=%d)", err);
+      PrintFormat("[EA WinINet Error] Connect to %s:%d failed (err=%d)", host, port, err);
+      return false;
+   }
+
+   // 3. Open HTTP request handle
+   uint reqFlags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE;
+   if(isHttps)
+   {
+      reqFlags |= INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
+   }
+
+   ulong hRequest = HttpOpenRequestW(
+      hConnect,
+      method,
+      path,
+      NULL,
+      NULL,
+      0,
+      reqFlags,
+      0
+   );
+
+   if(hRequest == 0)
+   {
+      int err = GetLastError();
+      InternetCloseHandle(hConnect);
+      InternetCloseHandle(hSession);
+      ExtLastPingMS = (int)(GetTickCount() - startTick);
+      ExtStatusText = StringFormat("HttpOpenRequestW failed (err=%d)", err);
+      PrintFormat("[EA WinINet Error] HttpOpenRequestW failed for %s %s (err=%d)", method, path, err);
+      return false;
+   }
+
+   // Apply timeouts on request handle as well for Wine compatibility
+   InternetSetOptionW(hRequest, INTERNET_OPTION_RECEIVE_TIMEOUT, rcvTimeout, 4);
+   InternetSetOptionW(hRequest, INTERNET_OPTION_SEND_TIMEOUT, sndTimeout, 4);
+
+   // 4. Prepare headers and payload
+   string hdrs = "Content-Type: application/json\r\n";
+   if(StringLen(InpAuthToken) > 0)
+      hdrs += "X-Token: " + InpAuthToken + "\r\n";
+
+   uchar bodyBytes[];
+   uint bodyLen = 0;
+   if(StringLen(postData) > 0)
+   {
+      int convLen = StringToCharArray(postData, bodyBytes, 0, WHOLE_ARRAY, CP_UTF8);
+      if(convLen > 0 && bodyBytes[convLen - 1] == 0)
+         bodyLen = (uint)(convLen - 1);
+      else
+         bodyLen = (uint)convLen;
+   }
+   else
+   {
+      ArrayResize(bodyBytes, 1);
+      bodyBytes[0] = 0;
+      bodyLen = 0;
+   }
+
+   // 5. Send HTTP request
+   bool sendSuccess = HttpSendRequestW(
+      hRequest,
+      hdrs,
+      (uint)StringLen(hdrs),
+      bodyBytes,
+      bodyLen
+   );
+
+   // If HTTPS failed due to SSL certificate checks (common in Wine without native CA store), retry with relaxed security flags
+   if(!sendSuccess && isHttps)
+   {
+      uint secFlags[1];
+      secFlags[0] = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_WRONG_USAGE | 
+                    SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+      InternetSetOptionW(hRequest, INTERNET_OPTION_SECURITY_FLAGS, secFlags, 4);
+      sendSuccess = HttpSendRequestW(hRequest, hdrs, (uint)StringLen(hdrs), bodyBytes, bodyLen);
+   }
+
+   ExtLastPingMS = (int)(GetTickCount() - startTick);
+
+   if(!sendSuccess)
+   {
+      int err = GetLastError();
+      InternetCloseHandle(hRequest);
+      InternetCloseHandle(hConnect);
+      InternetCloseHandle(hSession);
+      ExtStatusText = StringFormat("WinINet send failed (err=%d)", err);
+      PrintFormat("[EA WinINet Error] HttpSendRequestW failed for %s %s (err=%d)", method, path, err);
+      return false;
+   }
+
+   // 6. Query HTTP status code
+   int httpStatus = -1;
+   uchar numBuf[4];
+   ArrayInitialize(numBuf, 0);
+   uint numLen = 4;
+   uint numIdx = 0;
+   if(HttpQueryInfoW(hRequest, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, numBuf, numLen, numIdx))
+   {
+      httpStatus = (int)(numBuf[0] | (numBuf[1] << 8) | (numBuf[2] << 16) | (numBuf[3] << 24));
+   }
+
+   if(httpStatus <= 0)
+   {
+      uchar strBuf[32];
+      ArrayInitialize(strBuf, 0);
+      uint strLen = 32;
+      uint strIdx = 0;
+      if(HttpQueryInfoW(hRequest, HTTP_QUERY_STATUS_CODE, strBuf, strLen, strIdx))
+      {
+         string codeStr = CharArrayToString(strBuf, 0, strLen, CP_UTF16);
+         httpStatus = (int)StringToInteger(codeStr);
+      }
+   }
+
+   // Fallback: If send was successful and query didn't return code, assume 200
+   if(httpStatus <= 0)
+      httpStatus = 200;
+
+   outCode = httpStatus;
+
+   // 7. Read response body
+   uchar readBuffer[4096];
+   uint bytesRead = 0;
+   outResponse = "";
+
+   while(true)
+   {
+      ArrayInitialize(readBuffer, 0);
+      bytesRead = 0;
+      if(!InternetReadFile(hRequest, readBuffer, 4096, bytesRead))
+         break;
+      if(bytesRead == 0)
+         break;
+      outResponse += CharArrayToString(readBuffer, 0, bytesRead, CP_UTF8);
+   }
+
+   // 8. Clean up handles
+   InternetCloseHandle(hRequest);
+   InternetCloseHandle(hConnect);
+   InternetCloseHandle(hSession);
+
+   if(httpStatus == 200 || httpStatus == 201)
+   {
+      return true;
+   }
+
+   ExtStatusText = "HTTP Error " + IntegerToString(httpStatus);
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: MT5 Native WebRequest fallback                           |
 //| Requires: Tools → Options → Expert Advisors →                    |
 //|           Allow WebRequest for listed URL → add InpServerURL     |
 //+------------------------------------------------------------------+
-bool HttpRequest(const string method, const string endpoint, const string postData, string &outResponse, int &outCode)
+bool HttpRequestWebRequest(const string method, const string endpoint, const string postData, string &outResponse, int &outCode)
 {
    outCode     = -1;
    outResponse = "";
 
    string url = InpServerURL;
-   // Strip trailing slash from base URL
    if(StringLen(url) > 0 && StringGetCharacter(url, StringLen(url)-1) == '/')
       url = StringSubstr(url, 0, StringLen(url)-1);
-   url += endpoint;
+   if(StringLen(endpoint) > 0 && StringGetCharacter(endpoint, 0) != '/')
+      url += "/" + endpoint;
+   else
+      url += endpoint;
 
-   // --- Build request headers ---
    string hdrs = "Content-Type: application/json\r\n";
    if(StringLen(InpAuthToken) > 0)
       hdrs += "X-Token: " + InpAuthToken + "\r\n";
 
-   // --- Prepare body bytes (UTF-8, no null terminator) ---
    uchar body[];
    if(StringLen(postData) > 0)
    {
       int bodyLen = StringToCharArray(postData, body, 0, WHOLE_ARRAY, CP_UTF8);
-      // StringToCharArray appends a null terminator — remove it
       if(bodyLen > 0 && body[bodyLen-1] == 0)
          ArrayResize(body, bodyLen - 1);
    }
 
    uchar resultBody[];
    string resultHeaders;
-   int timeout = (InpPollTimeoutSec + 5) * 1000; // ms; a bit longer than poll timeout
+   int timeout = (InpPollTimeoutSec + 5) * 1000;
 
    uint startTick = GetTickCount();
    int httpStatus = WebRequest(method, url, hdrs, timeout, body, resultBody, resultHeaders);
@@ -159,7 +574,6 @@ bool HttpRequest(const string method, const string endpoint, const string postDa
    if(httpStatus == -1)
    {
       int err = GetLastError();
-      // ERR_WEBREQUEST_INVALID_ADDRESS (4014) = URL not whitelisted
       if(err == 4014)
          ExtStatusText = "WebRequest blocked: add " + InpServerURL + " to Tools→Options→Expert Advisors→Allow WebRequest";
       else
@@ -176,6 +590,28 @@ bool HttpRequest(const string method, const string endpoint, const string postDa
    outResponse = CharArrayToString(resultBody, 0, WHOLE_ARRAY, CP_UTF8);
    ExtStatusText = "HTTP Error " + IntegerToString(httpStatus);
    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Unified HTTP Request Dispatcher                                  |
+//+------------------------------------------------------------------+
+bool HttpRequest(const string method, const string endpoint, const string postData, string &outResponse, int &outCode)
+{
+   if(InpUseDLL)
+   {
+      if(MQLInfoInteger(MQL_DLLS_ALLOWED))
+         return HttpRequestDLL(method, endpoint, postData, outResponse, outCode);
+
+      // Fallback if DLL imports permission was revoked in terminal
+      static bool sWarnedDllDisabled = false;
+      if(!sWarnedDllDisabled)
+      {
+         Print("[EA Warning] InpUseDLL=true but 'Allow DLL imports' is not checked in MT5 settings. Falling back to native WebRequest.");
+         sWarnedDllDisabled = true;
+      }
+   }
+
+   return HttpRequestWebRequest(method, endpoint, postData, outResponse, outCode);
 }
 
 //+------------------------------------------------------------------+
@@ -690,22 +1126,24 @@ void ExecuteTradePayload(const string tradeJson)
       bool tradeCancelled = false;
       string cancelReason = "";
 
+      int stopsLevel = (int)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+      double safeDist = MathMax(stopsLevel * point, point); // Ensure at least 1 point distance
+
       if(isBuy)
       {
          if(forceLimit)
          {
-            // BUY LIMIT: entry below current Ask
-            if(pendingPrice < bidPrice)
+            // BUY LIMIT: valid if pendingPrice <= askPrice - safeDist
+            if(pendingPrice <= askPrice - safeDist)
             {
-               // Clearly below bid — normal pending limit
                success = ExecuteOrderWithRetry(tradeID, "BuyLimit", qty, pendingPrice, symbol, sl, tp, comment);
             }
             else if(pendingPrice <= askPrice)
             {
-               // Price is inside the spread — clamp to Ask (best executable buy price)
+               // Too close to market (inside stop level / spread) — execute as MARKET
                double clampedPrice = NormalizeDouble(askPrice, digits);
-               PrintFormat("[EA Spread Clamp] Buy Limit %.5f is inside spread [%.5f-%.5f] - clamped to Ask %.5f and executed as MARKET",
-                  pendingPrice, bidPrice, askPrice, clampedPrice);
+               PrintFormat("[EA Spread Clamp] Buy Limit %.5f is too close to Ask %.5f (StopsLevel: %.5f) - executed as MARKET",
+                  pendingPrice, askPrice, safeDist);
                success = ExecuteOrderWithRetry(tradeID, "Buy", qty, clampedPrice, symbol, sl, tp, comment);
             }
             else
@@ -717,22 +1155,23 @@ void ExecuteTradePayload(const string tradeJson)
          }
          else // BuyStop
          {
-            if(pendingPrice > askPrice)
+            // BUY STOP: valid if pendingPrice >= askPrice + safeDist
+            if(pendingPrice >= askPrice + safeDist)
             {
                // Normal: price has not yet reached stop level
                success = ExecuteOrderWithRetry(tradeID, "BuyStop", qty, pendingPrice, symbol, sl, tp, comment);
             }
-            else if(pendingPrice >= bidPrice)
+            else if(pendingPrice >= askPrice)
             {
-               // Price is inside the spread — clamp to Ask (best executable price)
+               // Too close to market (inside stop level / spread) — execute as MARKET
                double clampedPrice = NormalizeDouble(askPrice, digits);
-               PrintFormat("[EA Spread Clamp] Buy Stop %.5f is inside spread [%.5f-%.5f] - clamped to Ask %.5f and executed as MARKET",
-                  pendingPrice, bidPrice, askPrice, clampedPrice);
+               PrintFormat("[EA Spread Clamp] Buy Stop %.5f is too close to Ask %.5f (StopsLevel: %.5f) - executed as MARKET",
+                  pendingPrice, askPrice, safeDist);
                success = ExecuteOrderWithRetry(tradeID, "Buy", qty, clampedPrice, symbol, sl, tp, comment);
             }
             else
             {
-               // Price HAS CROSSED below bid — check TP / threshold
+               // Price HAS CROSSED Ask — check TP / threshold
                if(tp > 0 && askPrice >= tp)
                {
                   tradeCancelled = true;
@@ -775,18 +1214,17 @@ void ExecuteTradePayload(const string tradeJson)
       {
          if(forceLimit)
          {
-            // SELL LIMIT: entry above current Bid
-            if(pendingPrice > askPrice)
+            // SELL LIMIT: valid if pendingPrice >= bidPrice + safeDist
+            if(pendingPrice >= bidPrice + safeDist)
             {
-               // Clearly above ask — normal pending sell limit
                success = ExecuteOrderWithRetry(tradeID, "SellLimit", qty, pendingPrice, symbol, sl, tp, comment);
             }
             else if(pendingPrice >= bidPrice)
             {
-               // Price is inside the spread — clamp to Bid (best executable sell price)
+               // Too close to market (inside stop level / spread) — execute as MARKET
                double clampedPrice = NormalizeDouble(bidPrice, digits);
-               PrintFormat("[EA Spread Clamp] Sell Limit %.5f is inside spread [%.5f-%.5f] - clamped to Bid %.5f and executed as MARKET",
-                  pendingPrice, bidPrice, askPrice, clampedPrice);
+               PrintFormat("[EA Spread Clamp] Sell Limit %.5f is too close to Bid %.5f (StopsLevel: %.5f) - executed as MARKET",
+                  pendingPrice, bidPrice, safeDist);
                success = ExecuteOrderWithRetry(tradeID, "Sell", qty, clampedPrice, symbol, sl, tp, comment);
             }
             else
@@ -798,22 +1236,22 @@ void ExecuteTradePayload(const string tradeJson)
          }
          else // SellStop
          {
-            if(pendingPrice < bidPrice)
+            // SELL STOP: valid if pendingPrice <= bidPrice - safeDist
+            if(pendingPrice <= bidPrice - safeDist)
             {
-               // Normal: price has not yet reached stop level
                success = ExecuteOrderWithRetry(tradeID, "SellStop", qty, pendingPrice, symbol, sl, tp, comment);
             }
-            else if(pendingPrice <= askPrice)
+            else if(pendingPrice <= bidPrice)
             {
-               // Price is inside the spread — clamp to Bid
+               // Too close to market (inside stop level / spread) — execute as MARKET
                double clampedPrice = NormalizeDouble(bidPrice, digits);
-               PrintFormat("[EA Spread Clamp] Sell Stop %.5f is inside spread [%.5f-%.5f] - clamped to Bid %.5f and executed as MARKET",
-                  pendingPrice, bidPrice, askPrice, clampedPrice);
+               PrintFormat("[EA Spread Clamp] Sell Stop %.5f is too close to Bid %.5f (StopsLevel: %.5f) - executed as MARKET",
+                  pendingPrice, bidPrice, safeDist);
                success = ExecuteOrderWithRetry(tradeID, "Sell", qty, clampedPrice, symbol, sl, tp, comment);
             }
             else
             {
-               // Price HAS CROSSED above ask — check TP / threshold
+               // Price HAS CROSSED Bid — check TP / threshold
                if(tp > 0 && bidPrice <= tp)
                {
                   tradeCancelled = true;
@@ -1127,16 +1565,18 @@ void CreateDashboard()
    ObjectCreate(0, prefix + "BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
    ObjectSetInteger(0, prefix + "BG", OBJPROP_XDISTANCE, 20);
    ObjectSetInteger(0, prefix + "BG", OBJPROP_YDISTANCE, 30);
-   ObjectSetInteger(0, prefix + "BG", OBJPROP_XSIZE, 320);
+   ObjectSetInteger(0, prefix + "BG", OBJPROP_XSIZE, 330);
    ObjectSetInteger(0, prefix + "BG", OBJPROP_YSIZE, 140);
    ObjectSetInteger(0, prefix + "BG", OBJPROP_BGCOLOR, InpPanelBgColor);
    ObjectSetInteger(0, prefix + "BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+
+   string transportDesc = (InpUseDLL && MQLInfoInteger(MQL_DLLS_ALLOWED)) ? "WinINet DLL" : "WebRequest";
 
    CreateLabel(prefix + "Title", "TradingView Relay EA (Multi-Client)", 30, 40, C'0,180,255', 10, true);
    CreateLabel(prefix + "ID", "Client ID: " + ExtClientID, 30, 62, InpTextColor, 9, false);
    CreateLabel(prefix + "Status", "Status: " + ExtStatusText, 30, 80, InpTextColor, 9, false);
    CreateLabel(prefix + "Stats", "Executed: 0 | Failed: 0 | Ping: 0 ms", 30, 98, InpTextColor, 9, false);
-   CreateLabel(prefix + "Server", "Server: " + InpServerURL, 30, 116, C'150,160,175', 8, false);
+   CreateLabel(prefix + "Server", StringFormat("Server: %s [%s]", InpServerURL, transportDesc), 30, 116, C'150,160,175', 8, false);
    ChartRedraw();
 }
 
@@ -1154,6 +1594,8 @@ void CreateLabel(string name, string text, int x, int y, color clr, int fontSize
 void UpdateDashboard()
 {
    string prefix = "TV_Relay_";
+   string transportDesc = (InpUseDLL && MQLInfoInteger(MQL_DLLS_ALLOWED)) ? "WinINet DLL" : "WebRequest";
+   ObjectSetString(0, prefix + "Server", OBJPROP_TEXT, StringFormat("Server: %s [%s]", InpServerURL, transportDesc));
    ObjectSetString(0, prefix + "Status", OBJPROP_TEXT, "Status: " + ExtStatusText);
    ObjectSetString(0, prefix + "Stats", OBJPROP_TEXT, StringFormat("Executed: %d | Failed: %d | Ping: %d ms", ExtTotalExecuted, ExtTotalFailed, ExtLastPingMS));
    ChartRedraw();
