@@ -143,6 +143,10 @@ class MT5Worker:
         
         self.reported_tickets_file = os.path.join(self.clone_dir, "reported_tickets.json")
         self.reported_tickets = self._load_reported_tickets()
+        self.failed_ticket_attempts = {}
+        self.max_trade_retries = 3
+        self.trade_sync_batch_size = 10
+        self.trade_sync_delay = 0.25
         
         self.last_connected_status = None
         self.reported_balance_tickets_file = os.path.join(self.clone_dir, "reported_balance_tickets.json")
@@ -187,10 +191,12 @@ class MT5Worker:
         return set()
 
     def _save_reported_tickets(self):
-        """Persist reported trade ticket IDs to local storage."""
+        """Persist reported trade ticket IDs to local storage atomically."""
         try:
-            with open(self.reported_tickets_file, "w") as f:
+            temp_file = f"{self.reported_tickets_file}.tmp"
+            with open(temp_file, "w") as f:
                 json.dump(list(self.reported_tickets), f)
+            os.replace(temp_file, self.reported_tickets_file)
         except Exception as e:
             self.logger.error(f"Failed to save reported tickets list: {e}")
 
@@ -206,10 +212,12 @@ class MT5Worker:
         return set()
 
     def _save_reported_balance_tickets(self):
-        """Persist processed balance operation ticket IDs to local storage."""
+        """Persist processed balance operation ticket IDs to local storage atomically."""
         try:
-            with open(self.reported_balance_tickets_file, "w") as f:
+            temp_file = f"{self.reported_balance_tickets_file}.tmp"
+            with open(temp_file, "w") as f:
                 json.dump(list(self.reported_balance_tickets), f)
+            os.replace(temp_file, self.reported_balance_tickets_file)
         except Exception as e:
             self.logger.error(f"Failed to save reported balance tickets list: {e}")
 
@@ -225,20 +233,28 @@ class MT5Worker:
             payload = json.dumps(data).encode("utf-8")
             with urlopen(req, data=payload, timeout=15) as res:
                 response_body = res.read().decode("utf-8")
-                return json.loads(response_body)
+                parsed = json.loads(response_body) if response_body else {}
+                if isinstance(parsed, dict):
+                    parsed.setdefault("success", True)
+                    parsed["_status_code"] = getattr(res, "status", 200)
+                return parsed
         except HTTPError as e:
             body = e.read().decode("utf-8")
             self.logger.error(f"API Error POST {endpoint} (HTTP {e.code}): {body}")
             try:
-                return json.loads(body)
+                parsed = json.loads(body) if body else {}
+                if isinstance(parsed, dict):
+                    parsed.setdefault("success", False)
+                    parsed["_status_code"] = e.code
+                return parsed
             except Exception:
-                return {"success": False, "message": body}
+                return {"success": False, "message": body, "_status_code": e.code}
         except URLError as e:
             self.logger.error(f"Network Connection Failed POST {endpoint}: {e.reason}")
-            return {"success": False, "message": str(e.reason)}
+            return {"success": False, "message": str(e.reason), "_status_code": 0}
         except Exception as e:
             self.logger.error(f"Unexpected API error POST {endpoint}: {e}")
-            return {"success": False, "message": str(e)}
+            return {"success": False, "message": str(e), "_status_code": 0}
 
     def _has_executable(self):
         """Check if terminal executable is already in the clone directory."""
@@ -726,56 +742,123 @@ class MT5Worker:
             
         self.logger.debug(f"Retrieved {len(deals)} total deals from history.")
         new_trades_reported = 0
+        batch_count = 0
+        
+        deal_type_buy = getattr(mt5, "DEAL_TYPE_BUY", 0)
+        deal_type_sell = getattr(mt5, "DEAL_TYPE_SELL", 1)
         
         for deal in deals:
-            if deal.entry in (1, 2, 3) and str(deal.ticket) not in self.reported_tickets:
-                self.logger.info(f"Found new closed deal: Ticket={deal.ticket}, Symbol={deal.symbol}, Profit={deal.profit}")
-                
-                entry_price = 0.0
-                opened_at = deal.time
-                
-                position_id = deal.position_id
-                pos_deals = mt5.history_deals_get(position=position_id)
-                if pos_deals:
-                    for pd in pos_deals:
-                        if pd.entry == 0:
-                            entry_price = pd.price
-                            opened_at = pd.time
-                            break
-                
-                net_pl = deal.profit + deal.commission + deal.swap
-                
-                trade_payload = {
-                    "userId": self.user_id,
-                    "scriptCode": self.script_code,
-                    "externalTradeId": f"MT5-{deal.ticket}",
-                    "symbol": deal.symbol,
-                    "tradeType": "buy" if deal.type == 0 else "sell",
-                    "lotSize": deal.volume,
-                    "entryPrice": entry_price,
-                    "exitPrice": deal.price,
-                    "stopLoss": 0,
-                    "takeProfit": 0,
-                    "openedAt": datetime.datetime.fromtimestamp(opened_at, datetime.timezone.utc).isoformat(),
-                    "closedAt": datetime.datetime.fromtimestamp(deal.time, datetime.timezone.utc).isoformat(),
-                    "status": "closed",
-                    "profitLoss": net_pl,
-                    "commission": deal.commission,
-                    "swap": deal.swap,
-                    "balanceAfterTrade": mt5.account_info().balance if mt5.account_info() else 0.0,
-                    "mt5AccountStatus": "connected"
-                }
-                
-                res = self._send_api_post("/api/bot/trades", trade_payload)
-                if res.get("success"):
-                    self.logger.info(f"Successfully reported trade ticket {deal.ticket} to API.")
-                    self.reported_tickets.add(str(deal.ticket))
-                    new_trades_reported += 1
-                else:
-                    self.logger.error(f"Failed to report trade {deal.ticket}: {res.get('message')}")
-                    
-        if new_trades_reported > 0:
-            self._save_reported_tickets()
+            ticket_str = str(deal.ticket)
+            if ticket_str in self.reported_tickets:
+                continue
+
+            # Only process closed/exit deals (entry 1=out, 2=inout, 3=out_by)
+            if deal.entry not in (1, 2, 3):
+                continue
+
+            # Filter out non-trade operations (balance deposits/withdrawals, credit, adjustments)
+            if deal.type not in (deal_type_buy, deal_type_sell) or not deal.symbol:
+                self.reported_tickets.add(ticket_str)
+                self._save_reported_tickets()
+                continue
+
+            # Skip tickets that have permanently failed or exceeded max retries
+            attempts = self.failed_ticket_attempts.get(ticket_str, 0)
+            if attempts >= self.max_trade_retries:
+                continue
+
+            # Throttle total requests per cycle to prevent overwhelming the API
+            if batch_count >= self.trade_sync_batch_size:
+                self.logger.info(
+                    f"Reached batch limit ({self.trade_sync_batch_size}) for trade sync cycle. "
+                    "Remaining trades will be processed in the next cycle."
+                )
+                break
+
+            self.logger.info(f"Found new closed deal: Ticket={deal.ticket}, Symbol={deal.symbol}, Profit={deal.profit}")
+            
+            entry_price = 0.0
+            opened_at = deal.time
+            
+            position_id = deal.position_id
+            pos_deals = mt5.history_deals_get(position=position_id)
+            if pos_deals:
+                for pd in pos_deals:
+                    if pd.entry == 0:
+                        entry_price = pd.price
+                        opened_at = pd.time
+                        break
+            
+            net_pl = deal.profit + deal.commission + deal.swap
+            
+            trade_payload = {
+                "userId": self.user_id,
+                "scriptCode": self.script_code,
+                "externalTradeId": f"MT5-{deal.ticket}",
+                "symbol": deal.symbol,
+                "tradeType": "buy" if deal.type == deal_type_buy else "sell",
+                "lotSize": deal.volume,
+                "entryPrice": entry_price,
+                "exitPrice": deal.price,
+                "stopLoss": 0,
+                "takeProfit": 0,
+                "openedAt": datetime.datetime.fromtimestamp(opened_at, datetime.timezone.utc).isoformat(),
+                "closedAt": datetime.datetime.fromtimestamp(deal.time, datetime.timezone.utc).isoformat(),
+                "status": "closed",
+                "profitLoss": net_pl,
+                "commission": deal.commission,
+                "swap": deal.swap,
+                "balanceAfterTrade": mt5.account_info().balance if mt5.account_info() else 0.0,
+                "mt5AccountStatus": "connected"
+            }
+            
+            res = self._send_api_post("/api/bot/trades", trade_payload)
+            status_code = res.get("_status_code", 0)
+            msg = str(res.get("message", "")).lower()
+            is_success = bool(res.get("success")) or status_code in (200, 201)
+            is_duplicate = (
+                status_code == 409 or
+                "already exists" in msg or
+                "duplicate" in msg or
+                "already recorded" in msg
+            )
+
+            if is_success:
+                self.logger.info(f"Successfully reported trade ticket {deal.ticket} to API.")
+                self.reported_tickets.add(ticket_str)
+                self.failed_ticket_attempts.pop(ticket_str, None)
+                self._save_reported_tickets()
+                new_trades_reported += 1
+                batch_count += 1
+            elif is_duplicate:
+                self.logger.info(f"Trade ticket {deal.ticket} already recorded by API ({res.get('message')}). Marking as synced.")
+                self.reported_tickets.add(ticket_str)
+                self.failed_ticket_attempts.pop(ticket_str, None)
+                self._save_reported_tickets()
+                new_trades_reported += 1
+                batch_count += 1
+            elif status_code == 429:
+                self.logger.warning(
+                    f"API rate limit (HTTP 429) encountered while reporting trade {deal.ticket}. "
+                    "Suspending trade sync batch for this cycle."
+                )
+                break
+            else:
+                self.failed_ticket_attempts[ticket_str] = attempts + 1
+                curr_attempts = self.failed_ticket_attempts[ticket_str]
+                self.logger.error(
+                    f"Failed to report trade {deal.ticket} (Attempt {curr_attempts}/{self.max_trade_retries}, HTTP {status_code}): {res.get('message')}"
+                )
+                if curr_attempts >= self.max_trade_retries or status_code in (400, 422):
+                    self.logger.warning(
+                        f"Quarantining trade ticket {deal.ticket} after persistent error ({res.get('message')}) to avoid excessive API requests."
+                    )
+                    self.reported_tickets.add(ticket_str)
+                    self._save_reported_tickets()
+                batch_count += 1
+
+            if self.trade_sync_delay > 0:
+                time.sleep(self.trade_sync_delay)
 
     def sync_balance_operations(self):
         """Check for new balance operations (deposits/withdrawals) in history.
