@@ -135,6 +135,7 @@ input int      InpPendingOrderThresholdPoints = 50;     // Points from Market Pr
 input double   InpMaxTargetConsumedPercent   = 25.0;   // Max % of Entry-to-TP distance crossed before "Price Lost" (0 = disable)
 input int      InpPriceCrossedFallbackPoints = 50;     // Fallback Max Points crossed from Entry if TP is 0 (0 = disable)
 input bool     InpDrawPriceLostLabel         = true;   // Draw "Price Lost" label on candle when trade is cancelled
+input bool     InpDrawErrorLabel             = true;   // Draw Error label on chart with error info in object name
 input string   InpSymbolMap                  = "";     // Symbol Mapping (TV:MT5)
 
 input group "=== Dashboard Display ==="
@@ -787,6 +788,26 @@ bool IsStrategyMatch(ulong itemMagic, const string itemComment, const string ite
 }
 
 //+------------------------------------------------------------------+
+//| Helper: Sanitize string for MT5 object name                      |
+//+------------------------------------------------------------------+
+string SanitizeForObjName(const string text)
+{
+   string clean = text;
+   StringReplace(clean, " ", "_");
+   StringReplace(clean, ":", "_");
+   StringReplace(clean, "[", "");
+   StringReplace(clean, "]", "");
+   StringReplace(clean, "(", "");
+   StringReplace(clean, ")", "");
+   StringReplace(clean, "/", "_");
+   StringReplace(clean, "\\", "_");
+   StringReplace(clean, "-", "_");
+   StringReplace(clean, "\"", "");
+   StringReplace(clean, "'", "");
+   return clean;
+}
+
+//+------------------------------------------------------------------+
 //| Draw "Price Lost" Label on Chart Candle                          |
 //+------------------------------------------------------------------+
 void DrawPriceLostLabel(const string symbol, const string textMsg, bool isBuy, double entryPrice, double currentPrice)
@@ -823,7 +844,8 @@ void DrawPriceLostLabel(const string symbol, const string textMsg, bool isBuy, d
    double labelPrice = isBuy ? ((candleHigh > 0) ? candleHigh + (5 * point) : currentPrice)
                              : ((candleLow > 0)  ? candleLow  - (5 * point) : currentPrice);
 
-   string objName = "TV_PriceLost_" + symbol + "_" + IntegerToString((long)barTime) + "_" + IntegerToString(GetTickCount());
+   string cleanMsg = SanitizeForObjName(textMsg);
+   string objName = "TV_PriceLost_" + symbol + "_" + cleanMsg + "_" + IntegerToString((long)barTime) + "_" + IntegerToString(GetTickCount());
    if(ObjectCreate(targetChart, objName, OBJ_TEXT, 0, barTime, labelPrice))
    {
       ObjectSetString(targetChart, objName, OBJPROP_TEXT, " " + textMsg);
@@ -832,6 +854,73 @@ void DrawPriceLostLabel(const string symbol, const string textMsg, bool isBuy, d
       ObjectSetString(targetChart, objName, OBJPROP_FONT, "Arial Bold");
       ObjectSetInteger(targetChart, objName, OBJPROP_ANCHOR, isBuy ? ANCHOR_LOWER : ANCHOR_UPPER);
       ObjectSetString(targetChart, objName, OBJPROP_TOOLTIP, StringFormat("%s | Req: %.5f | Mkt: %.5f", textMsg, entryPrice, currentPrice));
+      ChartRedraw(targetChart);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw Error Label on Chart with Error Info in Object Name         |
+//+------------------------------------------------------------------+
+void DrawTradeErrorLabel(const string symbol, const string orderKind, uint retcode, const string errMsg, bool isBuy, double entryPrice, double currentPrice)
+{
+   if(!InpDrawErrorLabel)
+      return;
+
+   long targetChart = -1;
+   long cId = ChartFirst();
+   while(cId >= 0)
+   {
+      if(ChartSymbol(cId) == symbol)
+      {
+         targetChart = cId;
+         break;
+      }
+      cId = ChartNext(cId);
+   }
+
+   if(targetChart < 0)
+   {
+      if(ChartSymbol(0) == symbol)
+         targetChart = 0;
+      else
+         return; // Skip if no chart open for this symbol to avoid misplaced label
+   }
+
+   ENUM_TIMEFRAMES tf = (targetChart >= 0) ? ChartPeriod(targetChart) : _Period;
+   datetime barTime = iTime(symbol, tf, 0);
+   if(barTime == 0) barTime = TimeCurrent();
+
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point <= 0) point = 0.0001;
+
+   double candleHigh = iHigh(symbol, tf, 0);
+   double candleLow  = iLow(symbol, tf, 0);
+   double labelPrice = isBuy ? ((candleHigh > 0) ? candleHigh + (5 * point) : currentPrice)
+                             : ((candleLow > 0)  ? candleLow  - (5 * point) : currentPrice);
+
+   string cleanErr  = SanitizeForObjName(errMsg);
+   if(StringLen(cleanErr) == 0) cleanErr = "Error";
+   if(StringLen(cleanErr) > 24) cleanErr = StringSubstr(cleanErr, 0, 24);
+
+   string cleanKind = SanitizeForObjName(orderKind);
+   string cleanSym  = SanitizeForObjName(symbol);
+
+   // Embed symbol, action, retcode, and error description directly into object name
+   string objName = StringFormat("TV_Err_%s_%s_Code%u_%s_%I64d_%u",
+                                 cleanSym, cleanKind, retcode, cleanErr, (long)barTime, GetTickCount());
+
+   if(ObjectCreate(targetChart, objName, OBJ_TEXT, 0, barTime, labelPrice))
+   {
+      string displayTxt = StringFormat(" ❌ %s Err %u: %s", orderKind, retcode, errMsg);
+      ObjectSetString(targetChart, objName, OBJPROP_TEXT, displayTxt);
+      ObjectSetInteger(targetChart, objName, OBJPROP_COLOR, clrCrimson);
+      ObjectSetInteger(targetChart, objName, OBJPROP_FONTSIZE, 9);
+      ObjectSetString(targetChart, objName, OBJPROP_FONT, "Arial Bold");
+      ObjectSetInteger(targetChart, objName, OBJPROP_ANCHOR, isBuy ? ANCHOR_LOWER : ANCHOR_UPPER);
+      ObjectSetString(targetChart, objName, OBJPROP_TOOLTIP,
+         StringFormat("Order Error: %u (%s)\nAction: %s on %s\nReq Price: %.5f | Mkt: %.5f\nTime: %s",
+                      retcode, errMsg, orderKind, symbol, entryPrice, currentPrice,
+                      TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS)));
       ChartRedraw(targetChart);
    }
 }
@@ -852,37 +941,163 @@ bool ExecuteOrderWithRetry(const string tradeID,
 {
    int MAX_TRIES = 5;
    bool ok = false;
+   string currentKind = orderKind;
+   double currentPrice = orderPrice;
+   double currentSL = sl;
+   double currentTP = tp;
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point <= 0) point = 0.0001;
 
    for(int attempt = 1; attempt <= MAX_TRIES; attempt++)
    {
       ResetLastError();
 
-      // Refresh rates before every attempt so price is fresh
+      // On retries, add a brief delay and refresh rates
       if(attempt > 1)
       {
+         Sleep(50); // Allow quote stream and broker state to update
          ExtSymbol.RefreshRates();
-         // For pure market orders refresh price each retry
-         if(orderKind == "Buy")
-            orderPrice = ExtSymbol.Ask();
-         else if(orderKind == "Sell")
-            orderPrice = ExtSymbol.Bid();
+
+         double askPrice = ExtSymbol.Ask();
+         double bidPrice = ExtSymbol.Bid();
+         int stopsLevel = (int)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+         int minSLPointsRequired = MathMax(InpMinSLPoints, stopsLevel);
+         double safeDist = MathMax(stopsLevel * point, point);
+
+         // Check if previous attempt failed with invalid price/stops
+         uint lastRetcode = ExtTrade.ResultRetcode();
+         bool isInvalidPriceOrStops = (lastRetcode == 10015 /* INVALID_PRICE */ || lastRetcode == 10016 /* INVALID_STOPS */);
+
+         if(currentKind == "BuyStop")
+         {
+            // If market price reached/crossed the pending price or stops level prevents BuyStop
+            if(currentPrice < askPrice + safeDist || isInvalidPriceOrStops)
+            {
+               PrintFormat("[EA Retry Fallback] %s BuyStop at %.5f invalid (retcode=%u, Ask=%.5f, safeDist=%.5f) - Switching to MARKET BUY",
+                  symbol, currentPrice, lastRetcode, askPrice, safeDist);
+               currentKind = "Buy";
+               currentPrice = askPrice;
+
+               // Verify TP threshold
+               if(currentTP > 0 && currentPrice >= currentTP)
+               {
+                  PrintFormat("[EA Retry Abort] %s Market Buy at %.5f already reached/exceeded TP %.5f - Aborting.", symbol, currentPrice, currentTP);
+                  if(InpDrawPriceLostLabel)
+                     DrawPriceLostLabel(symbol, "Price Lost: TP Exceeded", true, orderPrice, currentPrice);
+                  DrawTradeErrorLabel(symbol, "Buy", 10015, "TP_Exceeded", true, orderPrice, currentPrice);
+                  return false;
+               }
+
+               // Re-adjust SL relative to new market entry price
+               if(currentSL > 0 && minSLPointsRequired > 0)
+               {
+                  double minSLDist = minSLPointsRequired * point;
+                  if(currentPrice - currentSL < minSLDist)
+                  {
+                     currentSL = NormalizeDouble(currentPrice - minSLDist, digits);
+                     PrintFormat("[EA Retry SL Adjust] Buy SL on %s adjusted to %.5f to meet min %d points from Ask %.5f",
+                        symbol, currentSL, minSLPointsRequired, currentPrice);
+                  }
+               }
+            }
+         }
+         else if(currentKind == "SellStop")
+         {
+            // If market price reached/crossed the pending price or stops level prevents SellStop
+            if(currentPrice > bidPrice - safeDist || isInvalidPriceOrStops)
+            {
+               PrintFormat("[EA Retry Fallback] %s SellStop at %.5f invalid (retcode=%u, Bid=%.5f, safeDist=%.5f) - Switching to MARKET SELL",
+                  symbol, currentPrice, lastRetcode, bidPrice, safeDist);
+               currentKind = "Sell";
+               currentPrice = bidPrice;
+
+               // Verify TP threshold
+               if(currentTP > 0 && currentPrice <= currentTP)
+               {
+                  PrintFormat("[EA Retry Abort] %s Market Sell at %.5f already reached/exceeded TP %.5f - Aborting.", symbol, currentPrice, currentTP);
+                  if(InpDrawPriceLostLabel)
+                     DrawPriceLostLabel(symbol, "Price Lost: TP Exceeded", false, orderPrice, currentPrice);
+                  DrawTradeErrorLabel(symbol, "Sell", 10015, "TP_Exceeded", false, orderPrice, currentPrice);
+                  return false;
+               }
+
+               // Re-adjust SL relative to new market entry price
+               if(currentSL > 0 && minSLPointsRequired > 0)
+               {
+                  double minSLDist = minSLPointsRequired * point;
+                  if(currentSL - currentPrice < minSLDist)
+                  {
+                     currentSL = NormalizeDouble(currentPrice + minSLDist, digits);
+                     PrintFormat("[EA Retry SL Adjust] Sell SL on %s adjusted to %.5f to meet min %d points from Bid %.5f",
+                        symbol, currentSL, minSLPointsRequired, currentPrice);
+                  }
+               }
+            }
+         }
+         else if(currentKind == "BuyLimit")
+         {
+            if(askPrice <= currentPrice || isInvalidPriceOrStops)
+            {
+               PrintFormat("[EA Retry Fallback] %s BuyLimit at %.5f crossed/invalid (Ask=%.5f) - Switching to MARKET BUY",
+                  symbol, currentPrice, askPrice);
+               currentKind = "Buy";
+               currentPrice = askPrice;
+            }
+         }
+         else if(currentKind == "SellLimit")
+         {
+            if(bidPrice >= currentPrice || isInvalidPriceOrStops)
+            {
+               PrintFormat("[EA Retry Fallback] %s SellLimit at %.5f crossed/invalid (Bid=%.5f) - Switching to MARKET SELL",
+                  symbol, currentPrice, bidPrice);
+               currentKind = "Sell";
+               currentPrice = bidPrice;
+            }
+         }
+         else if(currentKind == "Buy")
+         {
+            currentPrice = askPrice;
+            if(currentSL > 0 && minSLPointsRequired > 0)
+            {
+               double minSLDist = minSLPointsRequired * point;
+               if(currentPrice - currentSL < minSLDist)
+                  currentSL = NormalizeDouble(currentPrice - minSLDist, digits);
+            }
+         }
+         else if(currentKind == "Sell")
+         {
+            currentPrice = bidPrice;
+            if(currentSL > 0 && minSLPointsRequired > 0)
+            {
+               double minSLDist = minSLPointsRequired * point;
+               if(currentSL - currentPrice < minSLDist)
+                  currentSL = NormalizeDouble(currentPrice + minSLDist, digits);
+            }
+         }
       }
 
-      if(orderKind == "Buy")
-         ok = ExtTrade.Buy(vol, symbol, orderPrice, sl, tp, comment);
-      else if(orderKind == "Sell")
-         ok = ExtTrade.Sell(vol, symbol, orderPrice, sl, tp, comment);
-      else if(orderKind == "BuyLimit")
-         ok = ExtTrade.BuyLimit(vol, orderPrice, symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
-      else if(orderKind == "SellLimit")
-         ok = ExtTrade.SellLimit(vol, orderPrice, symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
-      else if(orderKind == "BuyStop")
-         ok = ExtTrade.BuyStop(vol, orderPrice, symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
-      else if(orderKind == "SellStop")
-         ok = ExtTrade.SellStop(vol, orderPrice, symbol, sl, tp, ORDER_TIME_GTC, 0, comment);
+      // Normalize prices before sending
+      if(currentPrice > 0) currentPrice = NormalizeDouble(currentPrice, digits);
+      if(currentSL > 0)    currentSL    = NormalizeDouble(currentSL, digits);
+      if(currentTP > 0)    currentTP    = NormalizeDouble(currentTP, digits);
+
+      if(currentKind == "Buy")
+         ok = ExtTrade.Buy(vol, symbol, currentPrice, currentSL, currentTP, comment);
+      else if(currentKind == "Sell")
+         ok = ExtTrade.Sell(vol, symbol, currentPrice, currentSL, currentTP, comment);
+      else if(currentKind == "BuyLimit")
+         ok = ExtTrade.BuyLimit(vol, currentPrice, symbol, currentSL, currentTP, ORDER_TIME_GTC, 0, comment);
+      else if(currentKind == "SellLimit")
+         ok = ExtTrade.SellLimit(vol, currentPrice, symbol, currentSL, currentTP, ORDER_TIME_GTC, 0, comment);
+      else if(currentKind == "BuyStop")
+         ok = ExtTrade.BuyStop(vol, currentPrice, symbol, currentSL, currentTP, ORDER_TIME_GTC, 0, comment);
+      else if(currentKind == "SellStop")
+         ok = ExtTrade.SellStop(vol, currentPrice, symbol, currentSL, currentTP, ORDER_TIME_GTC, 0, comment);
       else
       {
-         PrintFormat("[EA Retry] Unknown orderKind '%s' — aborting.", orderKind);
+         PrintFormat("[EA Retry] Unknown orderKind '%s' — aborting.", currentKind);
          return false;
       }
 
@@ -892,18 +1107,22 @@ bool ExecuteOrderWithRetry(const string tradeID,
       if(ok && retcode == TRADE_RETCODE_DONE)
       {
          if(attempt > 1)
-            PrintFormat("[EA Retry] %s %s SUCCESS on attempt %d/%d | retcode=%u",
-               orderKind, symbol, attempt, MAX_TRIES, retcode);
+            PrintFormat("[EA Retry] %s %s SUCCESS on attempt %d/%d | retcode=%u | price=%.5f",
+               currentKind, symbol, attempt, MAX_TRIES, retcode, currentPrice);
          return true;
       }
 
       // Log each failed attempt with retcode and broker message
       PrintFormat("[EA Retry] %s %s FAILED attempt %d/%d | retcode=%u | reason: %s | price=%.5f sl=%.5f tp=%.5f vol=%.2f",
-         orderKind, symbol, attempt, MAX_TRIES, retcode, errMsg, orderPrice, sl, tp, vol);
-
-      // No sleep between retries — MT5 retryable errors (requote, price_off)
-      // resolve in microseconds; a delay only adds latency.
+         currentKind, symbol, attempt, MAX_TRIES, retcode, errMsg, currentPrice, currentSL, currentTP, vol);
    }
+
+   // All retry attempts exhausted — draw error object on chart with error info in name
+   uint finalRetcode = ExtTrade.ResultRetcode();
+   string finalErrMsg = ExtTrade.ResultComment();
+   if(StringLen(finalErrMsg) == 0) finalErrMsg = "Retries_Exhausted";
+   bool isBuyOrder = (currentKind == "Buy" || currentKind == "BuyStop" || currentKind == "BuyLimit");
+   DrawTradeErrorLabel(symbol, currentKind, finalRetcode, finalErrMsg, isBuyOrder, orderPrice, currentPrice);
 
    return false; // all 5 attempts exhausted
 }
@@ -1307,6 +1526,7 @@ void ExecuteTradePayload(const string tradeJson)
          PrintFormat("[EA Price Lost] %s trade cancelled: %s", symbol, cancelReason);
          if(InpDrawPriceLostLabel)
             DrawPriceLostLabel(symbol, "Price Lost", isBuy, pendingPrice2, price);
+         DrawTradeErrorLabel(symbol, isBuy ? "BuyStop" : "SellStop", 0, "Price_Lost", isBuy, pendingPrice2, price);
          SendACK(tradeID, "cancelled", 0, 0, symbol, 0, price, cancelReason);
          ExtTotalFailed++;
          ExtStatusText = "Price Lost: " + symbol;
